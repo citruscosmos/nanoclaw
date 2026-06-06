@@ -18,7 +18,7 @@ NanoClaw の agent runtime を、既存の Anthropic Agent SDK(`claude` provider
 
 ### フェーズ
 - **フェーズ1**: `pi` provider を新設し、`claude` と `pi` の両方が選べる状態にする。Pi 側のツールは coding-agent から **必要最小限を cherry-pick** する。最小動作(ファイル/シェル操作 + NanoClaw 組み込みツール)が回ることをもって完了とする。
-- **フェーズ2**: フェーズ1で後送りにした **WebSearch / WebFetch** と **Task(サブエージェント)** を `pi` provider 上でも使えるようにする。あわせて**役割別モデル振り分け**(メイン Sonnet / コーディング local LLM / リサーチ DeepSeek、§5.5)を実現する。
+- **フェーズ1-2**: フェーズ1で後送りにした **WebSearch / WebFetch** と **Task(サブエージェント)** を `pi` provider 上でも使えるようにする。あわせて**役割別モデル振り分け**(メイン Sonnet / コーディング local LLM / リサーチ DeepSeek、§5.5)を実現する。
 
 ### 非ゴール(このドキュメントの範囲外)
 - `claude` provider の挙動変更。既存の `claude` 経路は一切壊さないこと。
@@ -216,14 +216,26 @@ export function getRegisteredTools(): readonly McpToolDefinition[] {
 
 ---
 
-## 5. フェーズ2: WebSearch / WebFetch と Task(サブエージェント)
+## 5. フェーズ1-2: WebSearch / WebFetch と Task(サブエージェント)
 
 フェーズ1完了後、`pi` provider に以下を追加する。いずれも `claude` provider が SDK 経由で持っていたが Pi にはない機能。**Pi の `AgentTool` として自前実装し、`tools` に足す**形を基本とする。
 
 ### WebSearch / WebFetch
+
+**設計方針: クライアントサイド実装が必須の理由**
+
+Anthropic は `web_search_20260209` / `web_fetch_20260209` というサーバーサイドツールを提供するが、Pi provider が扱う他のプロバイダはこれに相当する仕組みを持たないか、対応状況が一様でない(DeepSeek は一部バージョンでサーバーサイド対応があるが、ローカル LLM 等は未対応)。プロバイダ間で一貫した動作を保証するため、**`AgentTool` としてクライアントサイドで実装する**。これにより:
+
+- どのモデル(メイン Sonnet / コーディング local LLM / リサーチ DeepSeek)でも同一のツール実装が使える
+- プロバイダ固有のサーバーサイドツール対応状況に左右されない
+- 将来プロバイダを追加しても、ツール層の変更が不要
+
+なお `claude` provider では引き続き Anthropic のサーバーサイドツールが使われる(退避路としての `claude` 経路は変更しない)。Pi provider 上でのみ本クライアントサイド実装が使われる。
+
+**実装**:
 - coding-agent のツール一覧(bash/edit/find/grep/ls/read/write)にも**含まれない**。Pi 側にネイティブ実装は無い。
 - 自前で `AgentTool` を実装する:
-  - `web_search`: 検索 API(任意のプロバイダ)を叩き、結果を `content` に整形して返す。
+  - `web_search`: 検索 API(Brave Search / Tavily / SerpAPI 等、任意のプロバイダ)を叩き、結果を `content` に整形して返す。
   - `web_fetch`: URL を取得し本文抽出して返す。
 - host 連携が要る場合(APIキーの注入など)は、`ProviderOptions.env` 経由で鍵を渡し、必要なら host 側 `provider-container-registry.ts` に env passthrough を登録する。
 
@@ -308,7 +320,7 @@ export function getRegisteredTools(): readonly McpToolDefinition[] {
    - 長いツール実行中に idle kill されない(activity マッピングの検証)
 4. `claude` group と `pi` group を**併存**させて両方応答する。
 
-### フェーズ2 完了条件
+### フェーズ1-2 完了条件
 1. Pi group で `web_search` / `web_fetch` が動く。
 2. Pi group で `Task`(単一サブエージェント)が動き、子エージェントの結果が親に集約される。
 3. フェーズ1の全項目に回帰がない。
@@ -360,9 +372,9 @@ export function getRegisteredTools(): readonly McpToolDefinition[] {
 3. `mcp-tools/server.ts` に `getRegisteredTools()` を追記し、個別ツールモジュールを直接インポートして NanoClaw 組み込みツールを `AgentTool` ラップ(§4)。`ask_user_question` のブロッキングと `schedule_task` の host 連携を維持。`toolsConfig.allowed` フィルタリングを Pi ツールリストに適用(`DESIGN-phase1-group-config.md` 参照)。
 4. `beforeToolCall`/`afterToolCall` の空フック点を確保(§6)。
 5. フェーズ1完了条件(§8)を満たす。`claude` 併存を確認。
-6. (フェーズ2)`web_search`/`web_fetch` を自前 `AgentTool` で追加。
-7. (フェーズ2)`Task` を子 `Agent` 起動ツールとして追加。
-8. フェーズ2完了条件(§8)を満たす。
+6. (フェーズ1-2)`web_search`/`web_fetch` を自前 `AgentTool` で追加。
+7. (フェーズ1-2)`Task` を子 `Agent` 起動ツールとして追加。
+8. フェーズ1-2完了条件(§8)を満たす。
 
 ---
 
