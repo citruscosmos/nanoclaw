@@ -21,6 +21,11 @@ function log(msg: string): void {
 const allTools: McpToolDefinition[] = [];
 const toolMap = new Map<string, McpToolDefinition>();
 
+/** Expose all registered tools for Pi provider's in-process wrapping. */
+export function getRegisteredTools(): readonly McpToolDefinition[] {
+  return allTools;
+}
+
 export function registerTools(tools: McpToolDefinition[]): void {
   for (const t of tools) {
     if (toolMap.has(t.tool.name)) {
