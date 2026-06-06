@@ -12,9 +12,9 @@ import fs from 'fs';
 import path from 'path';
 
 import { Agent } from '@mariozechner/pi-agent-core';
-import type { AgentEvent, AgentMessage, AgentTool, AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult, ThinkingLevel } from '@mariozechner/pi-agent-core';
+import type { AgentEvent, AgentMessage, AgentTool, AgentToolUpdateCallback, AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult, ThinkingLevel } from '@mariozechner/pi-agent-core';
 import { getEnvApiKey, getModel, streamSimple } from '@mariozechner/pi-ai';
-import type { Message, TextContent, UserMessage } from '@mariozechner/pi-ai';
+import type { Message, Model, TextContent, UserMessage } from '@mariozechner/pi-ai';
 import {
   createBashTool,
   createEditTool,
@@ -217,6 +217,375 @@ function convertToLlm(messages: AgentMessage[]): Message[] {
   );
 }
 
+// ─── WebSearch ──────────────────────────────────────────────────────────────
+
+const WEB_SEARCH_PARAMS = {
+  type: 'object',
+  properties: {
+    query: { type: 'string', description: 'Search query' },
+    count: { type: 'number', description: 'Max results to return (1–20, default 10)', minimum: 1, maximum: 20 },
+  },
+  required: ['query'],
+} as const;
+
+async function braveSearch(query: string, count: number, apiKey: string): Promise<string> {
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json', 'X-Subscription-Token': apiKey },
+  });
+  if (!res.ok) throw new Error(`Brave Search API ${res.status}: ${res.statusText}`);
+  const data = (await res.json()) as {
+    web?: { results?: Array<{ title: string; url: string; description: string }> };
+  };
+  const results = data.web?.results ?? [];
+  if (results.length === 0) return 'No results found.';
+  return results
+    .slice(0, count)
+    .map((r, i) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.description}`)
+    .join('\n\n');
+}
+
+async function tavilySearch(query: string, count: number, apiKey: string): Promise<string> {
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: apiKey, query, max_results: count }),
+  });
+  if (!res.ok) throw new Error(`Tavily API ${res.status}: ${res.statusText}`);
+  const data = (await res.json()) as {
+    results?: Array<{ title: string; url: string; content: string }>;
+  };
+  const results = data.results ?? [];
+  if (results.length === 0) return 'No results found.';
+  return results
+    .slice(0, count)
+    .map((r, i) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.content}`)
+    .join('\n\n');
+}
+
+function buildWebSearchTool(env: Record<string, string | undefined>): AgentTool<any> {
+  const braveKey = env.BRAVE_SEARCH_API_KEY ?? process.env.BRAVE_SEARCH_API_KEY;
+  const tavilyKey = env.TAVILY_API_KEY ?? process.env.TAVILY_API_KEY;
+  return {
+    name: 'web_search',
+    label: 'Web Search',
+    description:
+      'Search the web for current information, documentation, news, or any topic requiring up-to-date external knowledge. Returns a ranked list of results with titles, URLs, and descriptions.',
+    parameters: WEB_SEARCH_PARAMS as any,
+    execute: async (_id, params: unknown) => {
+      const p = params as { query: string; count?: number };
+      const count = Math.min(Math.max(p.count ?? 10, 1), 20);
+      const query = p.query;
+      try {
+        let text: string;
+        if (braveKey) {
+          text = await braveSearch(query, count, braveKey);
+        } else if (tavilyKey) {
+          text = await tavilySearch(query, count, tavilyKey);
+        } else {
+          text = 'No search API configured. Set BRAVE_SEARCH_API_KEY or TAVILY_API_KEY in the container environment.';
+        }
+        return { content: [{ type: 'text' as const, text }], details: undefined };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Search failed: ${err instanceof Error ? err.message : String(err)}` }],
+          details: undefined,
+        };
+      }
+    },
+  } satisfies AgentTool<any>;
+}
+
+// ─── WebFetch ────────────────────────────────────────────────────────────────
+
+const WEB_FETCH_PARAMS = {
+  type: 'object',
+  properties: {
+    url: { type: 'string', description: 'URL to fetch' },
+    maxLength: {
+      type: 'number',
+      description: 'Max content characters to return (default 50000)',
+      minimum: 1000,
+      maximum: 200000,
+    },
+  },
+  required: ['url'],
+} as const;
+
+function extractTextFromHtml(html: string): string {
+  let text = html;
+  text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  text = text.replace(/<[^>]+>/g, ' ');
+  text = text
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function buildWebFetchTool(): AgentTool<any> {
+  return {
+    name: 'web_fetch',
+    label: 'Web Fetch',
+    description:
+      'Fetch and read the content of a URL. Use for reading web pages, online documentation, articles, or any resource when you know the specific URL.',
+    parameters: WEB_FETCH_PARAMS as any,
+    execute: async (_id, params: unknown) => {
+      const p = params as { url: string; maxLength?: number };
+      const maxLen = p.maxLength ?? 50000;
+      const url = p.url;
+      try {
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NanoClaw/1.0)' },
+          redirect: 'follow',
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        const ct = res.headers.get('content-type') ?? '';
+        let text = await res.text();
+        if (ct.includes('html') || ct.includes('xhtml')) {
+          text = extractTextFromHtml(text);
+        }
+        if (text.length > maxLen) {
+          text = text.slice(0, maxLen) + `\n\n[Truncated at ${maxLen} chars. Pass a larger maxLength to get more.]`;
+        }
+        return { content: [{ type: 'text' as const, text }], details: undefined };
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: `Fetch failed: ${err instanceof Error ? err.message : String(err)}` }],
+          details: undefined,
+        };
+      }
+    },
+  } satisfies AgentTool<any>;
+}
+
+// ─── Sub-agent model resolution ───────────────────────────────────────────────
+
+/**
+ * Create a Model object for a local OpenAI-compatible endpoint (Ollama/vLLM etc.).
+ * Use env vars PI_LOCAL_LLM_ENDPOINT and PI_LOCAL_LLM_MODEL to configure.
+ * Verify container → GPU host network connectivity before enabling (see §5.5 of design doc).
+ */
+function makeLocalLlmModel(endpoint: string, modelId: string): Model<any> {
+  return {
+    id: modelId,
+    name: `Local LLM (${modelId})`,
+    api: 'openai-completions',
+    provider: 'local',
+    baseUrl: endpoint.replace(/\/$/, ''),
+    reasoning: false,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 32768,
+    maxTokens: 8192,
+  } as unknown as Model<any>;
+}
+
+/**
+ * Resolve the model for a sub-agent role.
+ * Priority: explicit override → role env var → role default.
+ * Code default: local LLM if PI_LOCAL_LLM_ENDPOINT set, else claude-haiku-4-5.
+ * Research default: deepseek/deepseek-v4-flash.
+ */
+function resolveSubagentModel(
+  override: string | undefined,
+  role: 'code' | 'research',
+  env: Record<string, string | undefined>,
+): ReturnType<typeof resolveModel> {
+  if (override) return resolveModel(override);
+
+  const envKey = role === 'code' ? 'PI_CODE_MODEL' : 'PI_RESEARCH_MODEL';
+  const envModel = env[envKey] ?? process.env[envKey];
+  if (envModel) return resolveModel(envModel);
+
+  if (role === 'code') {
+    const endpoint = env.PI_LOCAL_LLM_ENDPOINT ?? process.env.PI_LOCAL_LLM_ENDPOINT;
+    if (endpoint) {
+      const localId = env.PI_LOCAL_LLM_MODEL ?? process.env.PI_LOCAL_LLM_MODEL ?? 'qwen3-14b';
+      log(`code_subagent: using local LLM at ${endpoint} model=${localId}`);
+      return makeLocalLlmModel(endpoint, localId) as ReturnType<typeof resolveModel>;
+    }
+    return resolveModel('claude-haiku-4-5');
+  }
+
+  return resolveModel('deepseek/deepseek-v4-flash');
+}
+
+// ─── Sub-agent runner ─────────────────────────────────────────────────────────
+
+async function runSubagent(params: {
+  task: string;
+  model: ReturnType<typeof resolveModel>;
+  tools: AgentTool<any>[];
+  systemPrompt: string;
+  getApiKey: (provider: string) => string | undefined;
+  signal?: AbortSignal;
+  onUpdate?: AgentToolUpdateCallback;
+}): Promise<string> {
+  const childAgent = new Agent({
+    initialState: {
+      systemPrompt: params.systemPrompt,
+      model: params.model as any,
+      tools: params.tools,
+    },
+    convertToLlm,
+    streamFn: (model, context, options) => streamSimple(model, context, options),
+    getApiKey: params.getApiKey,
+  });
+
+  if (params.signal) {
+    params.signal.addEventListener('abort', () => childAgent.abort(), { once: true });
+  }
+
+  let finalText = '';
+  let stepCount = 0;
+
+  const unsubscribe = childAgent.subscribe((event: AgentEvent) => {
+    if (
+      event.type === 'message_update' ||
+      event.type === 'tool_execution_start' ||
+      event.type === 'tool_execution_update'
+    ) {
+      stepCount++;
+      params.onUpdate?.({
+        content: [{ type: 'text', text: `[subagent step ${stepCount}]` }],
+        details: undefined,
+      });
+    }
+
+    if (event.type === 'agent_end') {
+      for (let i = event.messages.length - 1; i >= 0; i--) {
+        const m = event.messages[i];
+        if (typeof m === 'object' && m !== null && 'role' in m && (m as any).role === 'assistant') {
+          const asst = m as { content: Array<{ type: string; text?: string }> };
+          const parts = asst.content.filter((c) => c.type === 'text').map((c) => c.text ?? '');
+          if (parts.length > 0) {
+            finalText = parts.join('');
+            break;
+          }
+        }
+      }
+    }
+  });
+
+  try {
+    const userMsg: UserMessage = { role: 'user', content: params.task, timestamp: Date.now() };
+    await childAgent.prompt(userMsg);
+  } finally {
+    unsubscribe();
+  }
+
+  return finalText;
+}
+
+// ─── Sub-agent tool builders ──────────────────────────────────────────────────
+
+const CODE_SUBAGENT_PARAMS = {
+  type: 'object',
+  properties: {
+    task: { type: 'string', description: 'Coding task — describe what to implement, fix, or refactor, including relevant file paths and constraints' },
+    model: { type: 'string', description: 'Optional model override in provider/model-id format (e.g. anthropic/claude-haiku-4-5). Omit to use the configured default.' },
+  },
+  required: ['task'],
+} as const;
+
+const RESEARCH_SUBAGENT_PARAMS = {
+  type: 'object',
+  properties: {
+    task: { type: 'string', description: 'Research task — describe what information to find, the context, and what format the answer should be in' },
+    model: { type: 'string', description: 'Optional model override in provider/model-id format (e.g. deepseek/deepseek-v4-flash). Omit to use the configured default.' },
+  },
+  required: ['task'],
+} as const;
+
+interface SubagentOpts {
+  cwd: string;
+  env: Record<string, string | undefined>;
+  getApiKey: (provider: string) => string | undefined;
+}
+
+function buildCodeSubagentTool(opts: SubagentOpts): AgentTool<any> {
+  const defaultModel = resolveSubagentModel(undefined, 'code', opts.env);
+  return {
+    name: 'code_subagent',
+    label: 'Code Subagent',
+    description: [
+      'Launch a coding sub-agent that can read, write, edit, and run code files.',
+      'Use for: implementing features, writing scripts, refactoring, fixing bugs, or any task that requires creating or modifying files.',
+      'Do NOT use for: web research (use research_subagent instead), answering conceptual questions (answer directly), tasks that only need existing knowledge.',
+      'For compound tasks (e.g. "research X then implement it"): call research_subagent first, then code_subagent with the findings included in the task description.',
+    ].join('\n'),
+    parameters: CODE_SUBAGENT_PARAMS as any,
+    execute: async (_id, params: unknown, signal, onUpdate) => {
+      const p = params as { task: string; model?: string };
+      const model = p.model ? resolveSubagentModel(p.model, 'code', opts.env) : defaultModel;
+      const tools: AgentTool<any>[] = [
+        createReadTool(opts.cwd),
+        createWriteTool(opts.cwd),
+        createEditTool(opts.cwd),
+        createBashTool(opts.cwd),
+        createGrepTool(opts.cwd),
+        createFindTool(opts.cwd),
+        createLsTool(opts.cwd),
+      ];
+      const result = await runSubagent({
+        task: p.task,
+        model,
+        tools,
+        systemPrompt: 'You are a coding assistant. Complete the requested task carefully and thoroughly, reading existing code before modifying it.',
+        getApiKey: opts.getApiKey,
+        signal,
+        onUpdate,
+      });
+      return {
+        content: [{ type: 'text' as const, text: result || '(coding subagent produced no output)' }],
+        details: undefined,
+      };
+    },
+  } satisfies AgentTool<any>;
+}
+
+function buildResearchSubagentTool(
+  opts: SubagentOpts & { webSearch: AgentTool<any>; webFetch: AgentTool<any> },
+): AgentTool<any> {
+  const defaultModel = resolveSubagentModel(undefined, 'research', opts.env);
+  return {
+    name: 'research_subagent',
+    label: 'Research Subagent',
+    description: [
+      'Launch a research sub-agent with web search and web fetch capabilities.',
+      'Use for: finding current information, reading online documentation, researching a technology, gathering facts from the web.',
+      'Do NOT use for: writing or modifying code files (use code_subagent), tasks that only require knowledge already in context.',
+    ].join('\n'),
+    parameters: RESEARCH_SUBAGENT_PARAMS as any,
+    execute: async (_id, params: unknown, signal, onUpdate) => {
+      const p = params as { task: string; model?: string };
+      const model = p.model ? resolveSubagentModel(p.model, 'research', opts.env) : defaultModel;
+      const tools: AgentTool<any>[] = [opts.webSearch, opts.webFetch];
+      const result = await runSubagent({
+        task: p.task,
+        model,
+        tools,
+        systemPrompt:
+          'You are a research assistant with web search and fetch capabilities. Research the topic thoroughly, verify information from multiple sources when possible, and provide a comprehensive, accurate answer.',
+        getApiKey: opts.getApiKey,
+        signal,
+        onUpdate,
+      });
+      return {
+        content: [{ type: 'text' as const, text: result || '(research subagent produced no output)' }],
+        details: undefined,
+      };
+    },
+  } satisfies AgentTool<any>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export class PiProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -224,12 +593,22 @@ export class PiProvider implements AgentProvider {
   private readonly model: ReturnType<typeof resolveModel>;
   private readonly thinkingLevel: ThinkingLevel | undefined;
   private readonly additionalDirectories: string[];
+  private readonly env: Record<string, string | undefined>;
+  private readonly resolvedGetApiKey: (provider: string) => string | undefined;
   private readonly beforeToolCall: (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
   private readonly afterToolCall: (ctx: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 
   constructor(options: ProviderOptions = {}) {
     const toolsConfig = options.toolsConfig;
     const cwd = '/workspace/agent'; // default; overridden per-query via QueryInput.cwd
+    this.env = options.env ?? {};
+    this.resolvedGetApiKey = (provider: string): string | undefined => {
+      if (process.env.HTTPS_PROXY) return 'proxy-injected';
+      return getEnvApiKey(provider);
+    };
+
+    const webSearch = buildWebSearchTool(this.env);
+    const webFetch = buildWebFetchTool();
 
     const allTools: AgentTool<any>[] = [
       createReadTool(cwd),
@@ -240,6 +619,10 @@ export class PiProvider implements AgentProvider {
       createFindTool(cwd),
       createLsTool(cwd),
       ...buildNanoClawTools(),
+      webSearch,
+      webFetch,
+      buildCodeSubagentTool({ cwd, env: this.env, getApiKey: this.resolvedGetApiKey }),
+      buildResearchSubagentTool({ cwd, env: this.env, getApiKey: this.resolvedGetApiKey, webSearch, webFetch }),
     ];
 
     this.tools =
@@ -319,6 +702,8 @@ export class PiProvider implements AgentProvider {
     // Build per-query tool list with correct cwd
     const cwd = input.cwd;
     const toolsConfig = { allowed: this.tools.map((t) => t.name) };
+    const webSearch = buildWebSearchTool(this.env);
+    const webFetch = buildWebFetchTool();
     const cwdTools: AgentTool<any>[] = [
       createReadTool(cwd),
       createWriteTool(cwd),
@@ -328,6 +713,10 @@ export class PiProvider implements AgentProvider {
       createFindTool(cwd),
       createLsTool(cwd),
       ...buildNanoClawTools(),
+      webSearch,
+      webFetch,
+      buildCodeSubagentTool({ cwd, env: this.env, getApiKey: this.resolvedGetApiKey }),
+      buildResearchSubagentTool({ cwd, env: this.env, getApiKey: this.resolvedGetApiKey, webSearch, webFetch }),
     ].filter((t) => isToolAllowed(t.name, toolsConfig.allowed));
 
     const workspaceInstructions = loadWorkspaceInstructions(input.cwd);
@@ -355,15 +744,7 @@ export class PiProvider implements AgentProvider {
       },
       convertToLlm,
       streamFn: (model, context, options) => streamSimple(model, context, options),
-      getApiKey: (provider) => {
-        // When OneCLI proxy is active (HTTPS_PROXY), return a placeholder so
-        // the Pi agent proceeds to make the request. The proxy intercepts the
-        // call and injects the real credential for the matching host pattern.
-        // Without a proxy, delegate to pi-ai's env var lookup (e.g. MINIMAX_API_KEY,
-        // DEEPSEEK_API_KEY, ANTHROPIC_API_KEY) keyed by the provider name.
-        if (process.env.HTTPS_PROXY) return 'proxy-injected';
-        return getEnvApiKey(provider);
-      },
+      getApiKey: this.resolvedGetApiKey,
       beforeToolCall: this.beforeToolCall,
       afterToolCall: this.afterToolCall,
     });

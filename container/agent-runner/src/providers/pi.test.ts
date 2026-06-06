@@ -1,11 +1,13 @@
 /**
  * Pi provider regression suite (§8 of DESIGN-phase1-pi-provider.md).
  *
- * Covers the 4 seams:
+ * Covers the 4 seams (Phase 1) and Phase 1-2 tool additions:
  *  1. init event returns a continuation (sessionId)
  *  2. every Pi event produces an activity event (idle-kill prevention)
  *  3. cherry-picked tools (at least read / bash) are registered
  *  4. final result arrives as a result event
+ *  5. (Phase 1-2) web_search and web_fetch tools are registered
+ *  6. (Phase 1-2) code_subagent and research_subagent tools are registered
  *
  * These are integration-style tests against the real Pi Agent with a faux
  * (no-network) model so no API key is required.
@@ -80,5 +82,101 @@ describe('PiProvider seam 3: isSessionInvalid', () => {
   it('returns false (Phase 1 stub)', () => {
     const provider = createProvider('pi', { toolsConfig: null });
     expect(provider.isSessionInvalid(new Error('anything'))).toBe(false);
+  });
+});
+
+describe('PiProvider Phase 1-2: web tools', () => {
+  it('registers web_search tool', () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string }>;
+    };
+    const toolNames = provider.tools?.map((t) => t.name) ?? [];
+    expect(toolNames).toContain('web_search');
+  });
+
+  it('registers web_fetch tool', () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string }>;
+    };
+    const toolNames = provider.tools?.map((t) => t.name) ?? [];
+    expect(toolNames).toContain('web_fetch');
+  });
+
+  it('web_search and web_fetch are subject to toolsConfig filtering', () => {
+    const provider = createProvider('pi', {
+      toolsConfig: { allowed: ['read', 'bash'] },
+    }) as unknown as { tools: Array<{ name: string }> };
+    const toolNames = provider.tools?.map((t) => t.name) ?? [];
+    expect(toolNames).not.toContain('web_search');
+    expect(toolNames).not.toContain('web_fetch');
+  });
+
+  it('web_search returns no-key message when no API key is configured', async () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string; execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }> }>;
+    };
+    const tool = provider.tools?.find((t) => t.name === 'web_search');
+    expect(tool).toBeDefined();
+    const result = await tool!.execute('test-id', { query: 'test', count: 3 });
+    // Should gracefully report missing key rather than throw
+    expect(typeof result.content[0].text).toBe('string');
+  });
+
+  it('web_fetch returns error text (not throw) for unreachable URL', async () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string; execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }> }>;
+    };
+    const tool = provider.tools?.find((t) => t.name === 'web_fetch');
+    expect(tool).toBeDefined();
+    // Use an invalid URL that will fail without hitting the network
+    const result = await tool!.execute('test-id', { url: 'http://localhost:1' });
+    expect(typeof result.content[0].text).toBe('string');
+  });
+});
+
+describe('PiProvider Phase 1-2: sub-agent tools', () => {
+  it('registers code_subagent tool', () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string }>;
+    };
+    const toolNames = provider.tools?.map((t) => t.name) ?? [];
+    expect(toolNames).toContain('code_subagent');
+  });
+
+  it('registers research_subagent tool', () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string }>;
+    };
+    const toolNames = provider.tools?.map((t) => t.name) ?? [];
+    expect(toolNames).toContain('research_subagent');
+  });
+
+  it('sub-agent tools are subject to toolsConfig filtering', () => {
+    const provider = createProvider('pi', {
+      toolsConfig: { allowed: ['read', 'bash', 'web_search', 'web_fetch'] },
+    }) as unknown as { tools: Array<{ name: string }> };
+    const toolNames = provider.tools?.map((t) => t.name) ?? [];
+    expect(toolNames).not.toContain('code_subagent');
+    expect(toolNames).not.toContain('research_subagent');
+  });
+
+  it('code_subagent tool has required description fields', () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string; description: string; label: string }>;
+    };
+    const tool = provider.tools?.find((t) => t.name === 'code_subagent');
+    expect(tool).toBeDefined();
+    expect(tool!.description).toContain('coding sub-agent');
+    expect(tool!.label).toBe('Code Subagent');
+  });
+
+  it('research_subagent tool has required description fields', () => {
+    const provider = createProvider('pi', { toolsConfig: null }) as unknown as {
+      tools: Array<{ name: string; description: string; label: string }>;
+    };
+    const tool = provider.tools?.find((t) => t.name === 'research_subagent');
+    expect(tool).toBeDefined();
+    expect(tool!.description).toContain('research sub-agent');
+    expect(tool!.label).toBe('Research Subagent');
   });
 });
