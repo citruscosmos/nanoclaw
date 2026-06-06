@@ -8,6 +8,8 @@
  * Design ref: docs/cc/DESIGN-phase1-pi-provider.md
  */
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 import { Agent } from '@mariozechner/pi-agent-core';
 import type { AgentEvent, AgentMessage, AgentTool, AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult } from '@mariozechner/pi-agent-core';
@@ -131,6 +133,62 @@ function resolveModel(modelStr?: string) {
 }
 
 /**
+ * Recursively expand Claude Code `@` import directives in a file's content.
+ * Returns the fully resolved text, or '' if the file cannot be read.
+ * Symlinks are followed transparently by fs.readFileSync.
+ */
+function expandImports(filePath: string, visited = new Set<string>(), depth = 0): string {
+  if (depth > 10) return '';
+
+  let realPath: string;
+  let content: string;
+  try {
+    realPath = fs.realpathSync(filePath);
+    content = fs.readFileSync(realPath, 'utf8');
+  } catch {
+    return '';
+  }
+
+  if (visited.has(realPath)) return '';
+  visited.add(realPath);
+
+  const dir = path.dirname(filePath);
+  const lines: string[] = [];
+  for (const line of content.split('\n')) {
+    if (line.startsWith('@')) {
+      const importPath = path.resolve(dir, line.slice(1).trim());
+      lines.push(expandImports(importPath, visited, depth + 1));
+    } else if (/^<!--.*-->$/.test(line)) {
+      // strip single-line compose headers
+    } else {
+      lines.push(line);
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Load and expand CLAUDE.md + CLAUDE.local.md from the agent workspace,
+ * mirroring what Claude Code auto-loads for the Claude provider.
+ * Returns '' when running outside a container (no CLAUDE.md present).
+ */
+function loadWorkspaceInstructions(workspaceDir: string): string {
+  const parts: string[] = [];
+
+  const main = expandImports(path.join(workspaceDir, 'CLAUDE.md'));
+  if (main.trim()) parts.push(main.trim());
+
+  try {
+    const local = fs.readFileSync(path.join(workspaceDir, 'CLAUDE.local.md'), 'utf8');
+    if (local.trim()) parts.push(local.trim());
+  } catch {
+    // optional
+  }
+
+  return parts.join('\n\n');
+}
+
+/**
  * Convert Pi's AgentMessage[] to the Context-compatible Message[] the LLM expects.
  * Pi's UserMessage / AssistantMessage / ToolResultMessage are already Message-compatible.
  * Custom message types (notifications etc.) are dropped.
@@ -242,7 +300,9 @@ export class PiProvider implements AgentProvider {
       ...buildNanoClawTools(),
     ].filter((t) => isToolAllowed(t.name, toolsConfig.allowed));
 
+    const workspaceInstructions = loadWorkspaceInstructions(input.cwd);
     const systemPrompt = [
+      workspaceInstructions,
       this.systemPromptBase,
       input.systemContext?.instructions ?? '',
     ]
