@@ -74,15 +74,60 @@ function buildNanoClawTools(): AgentTool<any>[] {
   });
 }
 
-/** Build the default Anthropic Sonnet model for the main agent. */
-function buildDefaultModel() {
-  // claude-sonnet-4-6 is the model in use (matches current NanoClaw env).
-  // Fall back gracefully to a stable known ID if something changes.
-  try {
-    return getModel('anthropic', 'claude-sonnet-4-6' as never);
-  } catch {
-    return getModel('anthropic', 'claude-3-5-sonnet-20241022' as never);
+// Claude Code / NanoClaw model aliases → Anthropic model IDs registered in pi-ai.
+const ALIAS_MAP: Record<string, string> = {
+  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-4-6',
+  haiku: 'claude-haiku-4-5',
+};
+
+const DEFAULT_MODEL_ID = 'claude-sonnet-4-6';
+const FALLBACK_MODEL_ID = 'claude-3-5-sonnet-20241022';
+
+/**
+ * Resolve a NanoClaw model string to a pi-ai Model object.
+ *
+ * Accepted formats (all map through the 'anthropic' provider unless a
+ * provider prefix is given):
+ *   - omitted / null      → default (claude-sonnet-4-6)
+ *   - "sonnet" / "opus" / "haiku"  → alias expansion
+ *   - "claude-sonnet-4-6"           → raw Anthropic model ID
+ *   - "anthropic/claude-sonnet-4-6" → explicit provider/modelId
+ *   - "deepseek/deepseek-chat"      → arbitrary pi-ai provider/modelId
+ *
+ * Falls back to the default model when the requested ID is not in the
+ * pi-ai catalog so a misconfigured model doesn't crash the runner.
+ */
+function resolveModel(modelStr?: string) {
+  const tryGet = (provider: string, id: string) => {
+    try {
+      return getModel(provider as never, id as never);
+    } catch {
+      return null;
+    }
+  };
+
+  if (!modelStr) {
+    return tryGet('anthropic', DEFAULT_MODEL_ID) ?? getModel('anthropic', FALLBACK_MODEL_ID as never);
   }
+
+  // "provider/modelId" explicit form
+  const slashIdx = modelStr.indexOf('/');
+  if (slashIdx !== -1) {
+    const provider = modelStr.slice(0, slashIdx);
+    const id = modelStr.slice(slashIdx + 1);
+    const resolved = tryGet(provider, id);
+    if (resolved) return resolved;
+    log(`Model "${modelStr}" not found in pi-ai catalog, falling back to default`);
+    return tryGet('anthropic', DEFAULT_MODEL_ID) ?? getModel('anthropic', FALLBACK_MODEL_ID as never);
+  }
+
+  // Alias or raw Anthropic model ID
+  const id = ALIAS_MAP[modelStr] ?? modelStr;
+  const resolved = tryGet('anthropic', id);
+  if (resolved) return resolved;
+  log(`Model "${modelStr}" (resolved: "${id}") not found in pi-ai catalog, falling back to default`);
+  return tryGet('anthropic', DEFAULT_MODEL_ID) ?? getModel('anthropic', FALLBACK_MODEL_ID as never);
 }
 
 /**
@@ -104,7 +149,7 @@ export class PiProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
   private readonly tools: AgentTool<any>[];
-  private readonly model: ReturnType<typeof buildDefaultModel>;
+  private readonly model: ReturnType<typeof resolveModel>;
   private readonly systemPromptBase: string;
   private readonly beforeToolCall?: (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
   private readonly afterToolCall?: (ctx: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
@@ -129,7 +174,7 @@ export class PiProvider implements AgentProvider {
         ? allTools.filter((t) => isToolAllowed(t.name, toolsConfig.allowed))
         : allTools;
 
-    this.model = buildDefaultModel();
+    this.model = resolveModel(options.model);
     this.systemPromptBase = '';
 
     // AMCP mediator hook points — empty pass-through in Phase 1.
