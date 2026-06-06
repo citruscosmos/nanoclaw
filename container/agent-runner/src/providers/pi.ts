@@ -355,9 +355,17 @@ export class PiProvider implements AgentProvider {
       },
       convertToLlm,
       streamFn: (model, context, options) => streamSimple(model, context, options),
-      getApiKey: (provider) => {
-        if (provider === 'anthropic') return process.env.ANTHROPIC_API_KEY;
-        return undefined;
+      getApiKey: (_provider) => {
+        // When OneCLI proxy is active (HTTPS_PROXY), return a placeholder so
+        // the Pi agent proceeds to make the request. The proxy intercepts the
+        // call and injects the real credential for the matching host pattern.
+        // Without a proxy, fall back to standard env vars.
+        if (process.env.HTTPS_PROXY) return 'proxy-injected';
+        return (
+          process.env.ANTHROPIC_API_KEY ||
+          process.env.ANTHROPIC_OAUTH_TOKEN ||
+          process.env.DEEPSEEK_API_KEY
+        );
       },
       beforeToolCall: this.beforeToolCall,
       afterToolCall: this.afterToolCall,
@@ -434,12 +442,15 @@ export class PiProvider implements AgentProvider {
         await agent.prompt(userMsg);
 
         // Process follow-up messages until end() / abort().
+        // agent.followUp() only works DURING an active run; waitForIdle()
+        // resolves immediately when the agent is idle, so follow-ups queued
+        // after prompt() resolves are silently dropped. Use prompt() instead
+        // so each follow-up starts a real turn with a new agent_end event.
         while (!ended && !aborted) {
           if (pending.length > 0) {
             const text = pending.shift()!;
             const followUp: UserMessage = { role: 'user', content: text, timestamp: Date.now() };
-            agent.followUp(followUp);
-            await agent.waitForIdle();
+            await agent.prompt(followUp);
             continue;
           }
           await new Promise<void>((resolve) => {
