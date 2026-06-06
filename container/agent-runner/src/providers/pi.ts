@@ -12,7 +12,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { Agent } from '@mariozechner/pi-agent-core';
-import type { AgentEvent, AgentMessage, AgentTool, AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult } from '@mariozechner/pi-agent-core';
+import type { AgentEvent, AgentMessage, AgentTool, AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult, ThinkingLevel } from '@mariozechner/pi-agent-core';
 import { getModel, streamSimple } from '@mariozechner/pi-ai';
 import type { Message, TextContent, UserMessage } from '@mariozechner/pi-ai';
 import {
@@ -25,6 +25,7 @@ import {
   createWriteTool,
 } from '@mariozechner/pi-coding-agent';
 
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -34,6 +35,7 @@ import '../mcp-tools/core.js';
 import '../mcp-tools/scheduling.js';
 import '../mcp-tools/interactive.js';
 import '../mcp-tools/agents.js';
+import '../mcp-tools/self-mod.js';
 import { getRegisteredTools } from '../mcp-tools/server.js';
 
 function log(msg: string): void {
@@ -133,6 +135,18 @@ function resolveModel(modelStr?: string) {
 }
 
 /**
+ * Map NanoClaw/Claude effort strings to pi-agent-core ThinkingLevel.
+ * Claude: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+ * Pi:     'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+ */
+function effortToThinkingLevel(effort?: string): ThinkingLevel | undefined {
+  if (!effort) return undefined;
+  if (effort === 'max') return 'xhigh';
+  if (effort === 'low' || effort === 'medium' || effort === 'high' || effort === 'xhigh') return effort;
+  return undefined;
+}
+
+/**
  * Recursively expand Claude Code `@` import directives in a file's content.
  * Returns the fully resolved text, or '' if the file cannot be read.
  * Symlinks are followed transparently by fs.readFileSync.
@@ -208,9 +222,10 @@ export class PiProvider implements AgentProvider {
 
   private readonly tools: AgentTool<any>[];
   private readonly model: ReturnType<typeof resolveModel>;
-  private readonly systemPromptBase: string;
-  private readonly beforeToolCall?: (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
-  private readonly afterToolCall?: (ctx: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+  private readonly thinkingLevel: ThinkingLevel | undefined;
+  private readonly additionalDirectories: string[];
+  private readonly beforeToolCall: (ctx: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+  private readonly afterToolCall: (ctx: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 
   constructor(options: ProviderOptions = {}) {
     const toolsConfig = options.toolsConfig;
@@ -233,12 +248,27 @@ export class PiProvider implements AgentProvider {
         : allTools;
 
     this.model = resolveModel(options.model);
-    this.systemPromptBase = '';
+    this.thinkingLevel = effortToThinkingLevel(options.effort);
+    this.additionalDirectories = options.additionalDirectories ?? [];
 
-    // AMCP mediator hook points — empty pass-through in Phase 1.
-    // Phase 3: wire beforeToolCall / afterToolCall for IEDI recording.
-    this.beforeToolCall = undefined;
-    this.afterToolCall = undefined;
+    // beforeToolCall: record tool-in-flight so host-sweep can widen stuck tolerance.
+    // Also the AMCP mediator insertion point (Phase 3: add IEDI recording here).
+    this.beforeToolCall = async (ctx) => {
+      try {
+        setContainerToolInFlight(ctx.toolCall.name, null);
+      } catch (err) {
+        log(`beforeToolCall: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return undefined;
+    };
+    this.afterToolCall = async () => {
+      try {
+        clearContainerToolInFlight();
+      } catch (err) {
+        log(`afterToolCall: failed to clear container_state: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return undefined;
+    };
 
     log(`PiProvider ready — ${this.tools.length} tools: ${this.tools.map((t) => t.name).join(', ')}`);
   }
@@ -301,9 +331,13 @@ export class PiProvider implements AgentProvider {
     ].filter((t) => isToolAllowed(t.name, toolsConfig.allowed));
 
     const workspaceInstructions = loadWorkspaceInstructions(input.cwd);
+    const extraDirsNote =
+      this.additionalDirectories.length > 0
+        ? `## Additional directories\n${this.additionalDirectories.map((d) => `- ${d}`).join('\n')}`
+        : '';
     const systemPrompt = [
       workspaceInstructions,
-      this.systemPromptBase,
+      extraDirsNote,
       input.systemContext?.instructions ?? '',
     ]
       .filter(Boolean)
@@ -317,6 +351,7 @@ export class PiProvider implements AgentProvider {
         systemPrompt,
         model: this.model,
         tools: cwdTools,
+        ...(this.thinkingLevel !== undefined ? { thinkingLevel: this.thinkingLevel } : {}),
       },
       convertToLlm,
       streamFn: (model, context, options) => streamSimple(model, context, options),
