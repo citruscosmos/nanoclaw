@@ -13,7 +13,7 @@ import path from 'path';
 
 import { Agent } from '@mariozechner/pi-agent-core';
 import type { AgentEvent, AgentMessage, AgentTool, AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult, ThinkingLevel } from '@mariozechner/pi-agent-core';
-import { getModel, streamSimple } from '@mariozechner/pi-ai';
+import { getEnvApiKey, getModel, streamSimple } from '@mariozechner/pi-ai';
 import type { Message, TextContent, UserMessage } from '@mariozechner/pi-ai';
 import {
   createBashTool,
@@ -355,17 +355,14 @@ export class PiProvider implements AgentProvider {
       },
       convertToLlm,
       streamFn: (model, context, options) => streamSimple(model, context, options),
-      getApiKey: (_provider) => {
+      getApiKey: (provider) => {
         // When OneCLI proxy is active (HTTPS_PROXY), return a placeholder so
         // the Pi agent proceeds to make the request. The proxy intercepts the
         // call and injects the real credential for the matching host pattern.
-        // Without a proxy, fall back to standard env vars.
+        // Without a proxy, delegate to pi-ai's env var lookup (e.g. MINIMAX_API_KEY,
+        // DEEPSEEK_API_KEY, ANTHROPIC_API_KEY) keyed by the provider name.
         if (process.env.HTTPS_PROXY) return 'proxy-injected';
-        return (
-          process.env.ANTHROPIC_API_KEY ||
-          process.env.ANTHROPIC_OAUTH_TOKEN ||
-          process.env.DEEPSEEK_API_KEY
-        );
+        return getEnvApiKey(provider);
       },
       beforeToolCall: this.beforeToolCall,
       afterToolCall: this.afterToolCall,
