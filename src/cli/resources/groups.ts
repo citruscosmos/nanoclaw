@@ -28,6 +28,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
+    tools_config: row.tools_config ? JSON.parse(row.tools_config) : null,
     updated_at: row.updated_at,
   };
 }
@@ -213,7 +214,7 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope.',
+        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --tools-config.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -241,13 +242,36 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        if (Object.keys(updates).length === 0) {
+        let toolsConfigUpdated = false;
+        if (args['tools-config'] !== undefined) {
+          const raw = args['tools-config'] as string;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            throw new Error('--tools-config must be valid JSON');
+          }
+          if (
+            !parsed ||
+            typeof parsed !== 'object' ||
+            !Array.isArray((parsed as Record<string, unknown>).allowed) ||
+            !(parsed as Record<string, unknown[]>).allowed.every((t) => typeof t === 'string')
+          ) {
+            throw new Error('--tools-config must be JSON with shape: { "allowed": string[] }');
+          }
+          updateContainerConfigJson(id, 'tools_config', parsed);
+          toolsConfigUpdated = true;
+        }
+
+        if (Object.keys(updates).length === 0 && !toolsConfigUpdated) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --tools-config',
           );
         }
 
-        updateContainerConfigScalars(id, updates);
+        if (Object.keys(updates).length > 0) {
+          updateContainerConfigScalars(id, updates);
+        }
 
         const updated = getContainerConfig(id)!;
         return presentConfig(updated);

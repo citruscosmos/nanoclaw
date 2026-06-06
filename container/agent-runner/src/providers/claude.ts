@@ -68,6 +68,23 @@ function mcpAllowPattern(serverName: string): string {
   return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
 }
 
+/**
+ * Build the SDK allowedTools list from toolsConfig + mcpServers.
+ *
+ * - toolsConfig non-null: use toolsConfig.allowed directly (SDK_DISALLOWED_TOOLS
+ *   still enforced by preToolUseHook regardless).
+ * - toolsConfig null: backward-compatible default — TOOL_ALLOWLIST + all MCP servers.
+ */
+function buildAllowedTools(
+  toolsConfig: { allowed: string[] } | null,
+  mcpServers: Record<string, McpServerConfig>,
+): string[] {
+  if (toolsConfig !== null) {
+    return toolsConfig.allowed;
+  }
+  return [...TOOL_ALLOWLIST, ...Object.keys(mcpServers).map(mcpAllowPattern)];
+}
+
 interface SDKUserMessage {
   type: 'user';
   message: { role: 'user'; content: string };
@@ -337,6 +354,7 @@ export class ClaudeProvider implements AgentProvider {
   private additionalDirectories?: string[];
   private model?: string;
   private effort?: string;
+  private toolsConfig: { allowed: string[] } | null;
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
@@ -344,6 +362,7 @@ export class ClaudeProvider implements AgentProvider {
     this.additionalDirectories = options.additionalDirectories;
     this.model = options.model;
     this.effort = options.effort;
+    this.toolsConfig = options.toolsConfig ?? null;
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -404,10 +423,7 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
-        allowedTools: [
-          ...TOOL_ALLOWLIST,
-          ...Object.keys(this.mcpServers).map(mcpAllowPattern),
-        ],
+        allowedTools: buildAllowedTools(this.toolsConfig, this.mcpServers),
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
         model: this.model,

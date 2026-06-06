@@ -50,6 +50,12 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;
+  /**
+   * Per-group tool allowlist. When set, only tools matching a pattern in
+   * `allowed` are exposed to the agent. `null` = provider default (backward
+   * compatible). Empty array `[]` = all tools denied.
+   */
+  toolsConfig?: { allowed: string[] } | null;
 }
 
 export interface QueryInput {
